@@ -33,3 +33,4 @@ hf_cache/
 
 # papers (avoid committing PDFs)
 *.pdf
+RefreshKV.txt
