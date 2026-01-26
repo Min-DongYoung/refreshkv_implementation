@@ -1,0 +1,35 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# venv
+.venv/
+venv/
+ENV/
+env/
+
+# notebooks
+.ipynb_checkpoints/
+
+# logs & outputs
+logs/
+outputs/
+wandb/
+runs/
+
+# data/cache
+data/
+datasets_cache/
+hf_cache/
+.cache/
+*.jsonl
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# papers (avoid committing PDFs)
+*.pdf
