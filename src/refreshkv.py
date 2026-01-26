@@ -125,10 +125,19 @@ class QueryCapture:
                     raise RuntimeError("QueryCapture: hidden_states not found in hook inputs.")
                 q = module.q_proj(hidden_states)
                 bsz, seq_len, _ = q.shape
-                num_heads = getattr(module, "num_heads", None)
+                num_heads = getattr(module, "num_heads", None) or getattr(module, "num_attention_heads", None)
                 head_dim = getattr(module, "head_dim", None)
+                out_features = q.shape[-1]
+                if num_heads is None and head_dim is None and hasattr(module, "config"):
+                    num_heads = getattr(module.config, "num_attention_heads", None)
+                if num_heads is None and head_dim is not None:
+                    num_heads = out_features // head_dim
+                if head_dim is None and num_heads is not None:
+                    head_dim = out_features // num_heads
                 if num_heads is None or head_dim is None:
-                    raise RuntimeError("Attention module missing num_heads/head_dim.")
+                    raise RuntimeError(
+                        f"Attention module missing num_heads/head_dim (module={module.__class__.__name__})."
+                    )
                 q = q.view(bsz, seq_len, num_heads, head_dim).transpose(1, 2)
                 q_mean = q.mean(dim=1)  # [b, seq, head_dim]
                 self.q_mean[idx] = q_mean[:, -1, :].detach()
