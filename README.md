@@ -83,7 +83,7 @@ These are exposed as config options and called out here explicitly:
    Query similarity is computed via a **probe forward** using the partial cache at QC steps, then the actual forward uses the selected caches. This keeps caches immutable during QC checks (Invariant 5) and matches the paper's "QC stride" scheduling (PDF p.3). Config: `qc_stride`, `layerwise_qc`.
 
 4) **Uniform cache selection across layers (HF safety)**  
-   HF decoder-only models assume a single past length for the causal mask. We therefore **collapse per-layer decisions to a single step-level decision** at QC steps (min similarity across layers). This overrides per-layer mixing even if `layerwise_qc=True`. Logged as `uniform_enforced: true` in `events.jsonl`.
+   HF decoder-only models assume a single past length for the causal mask. We therefore **collapse per-layer decisions to a single step-level decision** at QC steps (min similarity across layers). This **overrides per-layer mixing even if `layerwise_qc=True`**, and the flag is kept only for compatibility/logging. Logged as `uniform_enforced: true` in `events.jsonl`.
 
 5) **First generated token**  
    We use **prefill logits** to generate the first token (standard HF behavior). This means token #1 is produced with full attention; scheduling starts at token #2. This is configurable only by code changes (see `first_token_from_prefill` note in `src/refreshkv.py`).

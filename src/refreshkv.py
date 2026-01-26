@@ -115,8 +115,14 @@ class QueryCapture:
             if attn is None or not hasattr(attn, "q_proj"):
                 raise RuntimeError("Attention module missing q_proj; cannot capture queries.")
 
-            def _hook(module, inputs, idx=idx):
-                hidden_states = inputs[0]
+            def _hook(module, inputs, kwargs, idx=idx):
+                hidden_states = None
+                if inputs:
+                    hidden_states = inputs[0]
+                else:
+                    hidden_states = kwargs.get("hidden_states", None)
+                if hidden_states is None:
+                    raise RuntimeError("QueryCapture: hidden_states not found in hook inputs.")
                 q = module.q_proj(hidden_states)
                 bsz, seq_len, _ = q.shape
                 num_heads = getattr(module, "num_heads", None)
@@ -129,7 +135,7 @@ class QueryCapture:
                 if self.log_per_head:
                     self.q_per_head[idx] = q[:, :, -1, :].detach()
 
-            handle = attn.register_forward_pre_hook(_hook)
+            handle = attn.register_forward_pre_hook(_hook, with_kwargs=True)
             self.handles.append(handle)
 
     def detach(self):
@@ -225,6 +231,7 @@ class RefreshKVGenerator:
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.entropy_stats = EntropyStats()
+        self._layerwise_warned = False
 
     def _device(self):
         return next(self.model.parameters()).device
@@ -401,6 +408,15 @@ class RefreshKVGenerator:
 
         for step in range(step_start + 1, max_new_tokens + 1):
             is_check = cfg.qc_stride > 0 and (step % cfg.qc_stride == 0)
+            if cfg.layerwise_qc and (not self._layerwise_warned) and logger is not None:
+                logger.log_event(
+                    {
+                        "step": step,
+                        "warning": "layerwise_qc_ignored_for_execution",
+                        "detail": "Uniform cache selection enforced per step for HF safety.",
+                    }
+                )
+                self._layerwise_warned = True
 
             # Probe for queries (and entropy trigger) using partial caches
             q_probe = None
