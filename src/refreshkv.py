@@ -167,7 +167,11 @@ def _to_cache_if_needed(model, pkv):
     if pkv is None:
         return None
     # If a cache class is expected, convert legacy list/tuple to DynamicCache.
-    if hasattr(model, "_supports_cache_class") and model._supports_cache_class:
+    if hasattr(model, "model") and hasattr(model.model, "_supports_cache_class"):
+        supports_cache = model.model._supports_cache_class
+    else:
+        supports_cache = getattr(model, "_supports_cache_class", False)
+    if supports_cache:
         try:
             from transformers.cache_utils import DynamicCache
 
