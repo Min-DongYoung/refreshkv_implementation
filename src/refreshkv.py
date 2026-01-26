@@ -47,7 +47,7 @@ class RefreshKVConfig:
     entropy_warmup: int = 10
 
     # Behavior flags
-    layerwise_qc: bool = True
+    layerwise_qc: bool = False
     log_per_head_similarity: bool = False
     log_decoded_tokens: bool = False
     first_token_from_prefill: bool = True
@@ -471,30 +471,46 @@ class RefreshKVGenerator:
             # Decide which cache to use per layer
             num_layers = len(state.cf)
             layer_use_full = [False for _ in range(num_layers)]
+            uniform_enforced = False
+            min_similarity = None
+            use_full_decision = None
+            decision_agg = None
             if is_check:
                 if cfg.trigger_mode == "entropy":
-                    layer_use_full = [entropy_fired for _ in range(num_layers)]
+                    use_full = bool(entropy_fired)
+                    decision_agg = "entropy"
                 elif cfg.trigger_mode == "baseline":
-                    if cfg.layerwise_qc:
-                        for l in range(num_layers):
-                            sim = per_layer_sim[l] if per_layer_sim is not None else None
-                            layer_use_full[l] = sim is not None and (sim <= cfg.similarity_threshold)
-                    else:
-                        sims = [s for s in per_layer_sim if s is not None]
-                        overall = min(sims) if sims else 1.0
-                        layer_use_full = [overall <= cfg.similarity_threshold for _ in range(num_layers)]
+                    sims = [s for s in (per_layer_sim or []) if s is not None]
+                    min_similarity = min(sims) if sims else 1.0
+                    use_full = min_similarity <= cfg.similarity_threshold
+                    decision_agg = "min"
                 elif cfg.trigger_mode == "hybrid":
                     if entropy_fired:
-                        layer_use_full = [True for _ in range(num_layers)]
+                        use_full = True
+                        decision_agg = "entropy"
                     else:
-                        if cfg.layerwise_qc:
-                            for l in range(num_layers):
-                                sim = per_layer_sim[l] if per_layer_sim is not None else None
-                                layer_use_full[l] = sim is not None and (sim <= cfg.similarity_threshold)
-                        else:
-                            sims = [s for s in per_layer_sim if s is not None]
-                            overall = min(sims) if sims else 1.0
-                            layer_use_full = [overall <= cfg.similarity_threshold for _ in range(num_layers)]
+                        sims = [s for s in (per_layer_sim or []) if s is not None]
+                        min_similarity = min(sims) if sims else 1.0
+                        use_full = min_similarity <= cfg.similarity_threshold
+                        decision_agg = "min"
+                else:
+                    use_full = False
+                # HF safety: enforce uniform cache selection across layers at each step.
+                layer_use_full = [use_full for _ in range(num_layers)]
+                uniform_enforced = True
+                use_full_decision = use_full
+
+            # Safety invariant: no per-layer mixing within a step.
+            if is_check and len(set(layer_use_full)) > 1:
+                if logger is not None:
+                    logger.log_event(
+                        {
+                            "step": step,
+                            "error": "non_uniform_layer_use_full",
+                            "layer_use_full": layer_use_full,
+                        }
+                    )
+                raise RuntimeError("Non-uniform layer_use_full detected; per-layer mixing is unsafe under HF.")
 
             # Merge pending tokens into Cf for layers that will use full cache
             for l in range(num_layers):
@@ -505,6 +521,19 @@ class RefreshKVGenerator:
             pkv_in = []
             for l in range(num_layers):
                 pkv_in.append(state.cf[l] if (is_check and layer_use_full[l]) else state.cp[l])
+            # Safety invariant: past lengths must match across layers for the chosen cache.
+            past_lengths = [pkv_in[l][0].shape[2] for l in range(num_layers)]
+            if len(set(past_lengths)) != 1:
+                if logger is not None:
+                    logger.log_event(
+                        {
+                            "step": step,
+                            "error": "non_uniform_past_lengths",
+                            "past_lengths": past_lengths,
+                            "layer_use_full": layer_use_full,
+                        }
+                    )
+                raise RuntimeError("Non-uniform past_key_values lengths across layers.")
 
             # Actual forward (with attention scores if needed)
             start_t = time.time()
@@ -697,12 +726,16 @@ class RefreshKVGenerator:
                                 "similarity_threshold": cfg.similarity_threshold,
                                 "overall_score": overall_sim,
                                 "overall_agg": "mean",
+                                "min_similarity": min_similarity,
+                                "decision_agg": decision_agg,
                                 "per_layer_similarity": per_layer_sim,
                                 "per_head_similarity": per_head_sim,
                                 "head_aggregation": cfg.head_aggregation,
                                 "entropy": probe_entropy,
                                 "entropy_z": probe_entropy_z if cfg.entropy_use_zscore else None,
                                 "entropy_fired": entropy_fired,
+                                "use_full": use_full_decision,
+                                "uniform_enforced": uniform_enforced,
                             },
                             "refresh": {
                                 "layers": refresh_layers,

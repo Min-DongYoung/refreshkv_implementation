@@ -22,7 +22,7 @@ entropy_use_zscore: false
 entropy_zscore_k: 2.0
 entropy_warmup: 10
 
-layerwise_qc: true
+layerwise_qc: false
 log_per_head_similarity: false
 log_decoded_tokens: false
 first_token_from_prefill: true
