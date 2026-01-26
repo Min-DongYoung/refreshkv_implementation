@@ -177,6 +177,40 @@ def _to_cache_if_needed(model, pkv):
         return pkv
 
 
+def _ensure_cache(model, pkv, cache_position, logger=None, step=None, tag=None):
+    if pkv is None:
+        return None
+    if hasattr(pkv, "get_mask_sizes"):
+        cache_obj = pkv
+        converted = False
+    else:
+        try:
+            from transformers.cache_utils import DynamicCache
+
+            cache_obj = DynamicCache.from_legacy_cache(pkv)
+            converted = True
+        except Exception as exc:
+            raise RuntimeError(
+                "past_key_values must be a Cache object when cache_position is provided. "
+                "Conversion to DynamicCache failed."
+            ) from exc
+    if not hasattr(cache_obj, "get_mask_sizes"):
+        raise RuntimeError("past_key_values must implement Cache API (get_mask_sizes).")
+    if logger is not None and step is not None:
+        logger.log_event(
+            {
+                "step": step,
+                "cache_call": {
+                    "tag": tag,
+                    "cache_type": cache_obj.__class__.__name__,
+                    "from_legacy": converted,
+                    "cache_position": int(cache_position) if cache_position is not None else None,
+                },
+            }
+        )
+    return cache_obj
+
+
 def _model_forward(model, **kwargs):
     sig = inspect.signature(model.forward)
     filtered = {k: v for k, v in kwargs.items() if k in sig.parameters and v is not None}
@@ -508,10 +542,18 @@ class RefreshKVGenerator:
                 capture = QueryCapture(self.model, log_per_head=cfg.log_per_head_similarity)
                 capture.attach()
                 with torch.inference_mode():
+                    probe_cache = _ensure_cache(
+                        self.model,
+                        state.cp,
+                        cache_position=abs_pos,
+                        logger=logger,
+                        step=step,
+                        tag="qc_probe",
+                    )
                     probe_out = _model_forward(
                         self.model,
                         input_ids=current_token,
-                        past_key_values=state.cp,
+                        past_key_values=probe_cache,
                         use_cache=False,
                         output_attentions=False,
                         return_dict=True,
@@ -612,6 +654,14 @@ class RefreshKVGenerator:
             pkv_in = []
             for l in range(num_layers):
                 pkv_in.append(state.cf[l] if (is_check and layer_use_full[l]) else state.cp[l])
+            pkv_cache = _ensure_cache(
+                self.model,
+                pkv_in,
+                cache_position=abs_pos,
+                logger=logger,
+                step=step,
+                tag="decode",
+            )
             # Safety invariant: past lengths must match across layers for the chosen cache.
             past_lengths = [pkv_in[l][0].shape[2] for l in range(num_layers)]
             if len(set(past_lengths)) != 1:
@@ -638,7 +688,7 @@ class RefreshKVGenerator:
                 out = _model_forward(
                     self.model,
                     input_ids=current_token,
-                    past_key_values=pkv_in,
+                    past_key_values=pkv_cache,
                     use_cache=True,
                     output_attentions=True,
                     return_dict=True,
