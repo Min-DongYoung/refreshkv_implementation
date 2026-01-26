@@ -22,6 +22,24 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def force_eager_attention():
+    if torch.cuda.is_available() and hasattr(torch.backends, "cuda"):
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+
+
+def assert_eager_attention(model):
+    attn_impl = getattr(model.config, "attn_implementation", None)
+    if attn_impl is None:
+        attn_impl = getattr(model.config, "_attn_implementation", None)
+    print(f"Attention implementation: {attn_impl}")
+    if attn_impl != "eager":
+        raise RuntimeError(
+            f"Expected eager attention, got {attn_impl}. Disable SDPA/FlashAttention and set attn_implementation='eager'."
+        )
+
+
 def load_config(path: str) -> RefreshKVConfig:
     if not os.path.exists(path):
         return RefreshKVConfig()
@@ -79,6 +97,7 @@ def main():
         cfg.max_new_tokens = args.max_new_tokens
 
     set_seed(cfg.seed)
+    force_eager_attention()
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -88,6 +107,7 @@ def main():
         device_map="auto" if cfg.device == "cuda" else None,
     )
     model.eval()
+    assert_eager_attention(model)
 
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id

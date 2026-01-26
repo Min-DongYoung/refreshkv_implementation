@@ -169,6 +169,37 @@ def _model_forward(model, **kwargs):
     return model(**filtered)
 
 
+def _force_eager_attention(model) -> None:
+    # Best-effort switches to ensure attention weights are returned.
+    if hasattr(model, "config"):
+        model.config.use_cache = True
+        model.config.output_attentions = True
+        if hasattr(model.config, "attn_implementation"):
+            model.config.attn_implementation = "eager"
+        if hasattr(model.config, "_attn_implementation"):
+            model.config._attn_implementation = "eager"
+    if hasattr(model, "attn_implementation"):
+        model.attn_implementation = "eager"
+    if hasattr(model, "_attn_implementation"):
+        model._attn_implementation = "eager"
+    # Disable SDPA fast paths so attentions are materialized.
+    if hasattr(torch, "backends") and hasattr(torch.backends, "cuda"):
+        for fn_name, val in (
+            ("enable_flash_sdp", False),
+            ("enable_mem_efficient_sdp", False),
+            ("enable_math_sdp", True),
+        ):
+            fn = getattr(torch.backends.cuda, fn_name, None)
+            if callable(fn):
+                fn(val)
+    # Best-effort per-layer override
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        for layer in model.model.layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None and hasattr(attn, "attn_implementation"):
+                attn.attn_implementation = "eager"
+
+
 def _aggregate_attention(attn: torch.Tensor, mode: str) -> torch.Tensor:
     # attn: [b, heads, tgt_len, src_len]
     attn = attn.float()
@@ -273,7 +304,26 @@ class RefreshKVGenerator:
         logits = outputs.logits
 
         if past is None or attentions is None:
-            raise RuntimeError("Model did not return past_key_values/attentions; set attn_implementation='eager'.")
+            # Retry once with eager attention forced; required to access attention scores.
+            _force_eager_attention(self.model)
+            with torch.inference_mode():
+                outputs = _model_forward(
+                    self.model,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    use_cache=True,
+                    output_attentions=True,
+                    return_dict=True,
+                )
+            past = _normalize_past_key_values(outputs.past_key_values)
+            attentions = outputs.attentions
+            if past is None or attentions is None:
+                raise RuntimeError(
+                    "Model did not return past_key_values/attentions; ensure eager attention is enabled "
+                    "(attn_implementation='eager', SDPA disabled)."
+                )
 
         num_layers = len(past)
         prompt_len = input_ids.shape[1]
