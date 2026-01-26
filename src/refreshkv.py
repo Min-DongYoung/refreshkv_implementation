@@ -166,20 +166,15 @@ def _normalize_past_key_values(pkv):
 def _to_cache_if_needed(model, pkv):
     if pkv is None:
         return None
-    # If a cache class is expected, convert legacy list/tuple to DynamicCache.
-    if hasattr(model, "model") and hasattr(model.model, "_supports_cache_class"):
-        supports_cache = model.model._supports_cache_class
-    else:
-        supports_cache = getattr(model, "_supports_cache_class", False)
-    if supports_cache:
-        try:
-            from transformers.cache_utils import DynamicCache
+    if hasattr(pkv, "get_mask_sizes"):
+        return pkv
+    # Convert legacy list/tuple to a Cache object whenever possible.
+    try:
+        from transformers.cache_utils import DynamicCache
 
-            if not hasattr(pkv, "get_mask_sizes"):
-                return DynamicCache.from_legacy_cache(pkv)
-        except Exception:
-            return pkv
-    return pkv
+        return DynamicCache.from_legacy_cache(pkv)
+    except Exception:
+        return pkv
 
 
 def _model_forward(model, **kwargs):
