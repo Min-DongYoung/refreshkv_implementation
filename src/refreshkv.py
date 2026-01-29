@@ -367,8 +367,24 @@ class RefreshKVGenerator:
                 self.prev_attn = getattr(model.config, "attn_implementation", None)
                 self.prev_attn_priv = getattr(model.config, "_attn_implementation", None)
                 self.layer_prev = []
+                self.prev_sdp = {}
 
             def __enter__(self):
+                # Save current SDPA settings if available, then disable fast SDP paths.
+                if hasattr(torch, "backends") and hasattr(torch.backends, "cuda"):
+                    for name, getter, setter, value in (
+                        ("flash", "flash_sdp_enabled", "enable_flash_sdp", False),
+                        ("mem_efficient", "mem_efficient_sdp_enabled", "enable_mem_efficient_sdp", False),
+                        ("math", "math_sdp_enabled", "enable_math_sdp", True),
+                    ):
+                        get_fn = getattr(torch.backends.cuda, getter, None)
+                        set_fn = getattr(torch.backends.cuda, setter, None)
+                        if callable(get_fn) and callable(set_fn):
+                            try:
+                                self.prev_sdp[name] = get_fn()
+                                set_fn(value)
+                            except Exception:
+                                pass
                 if hasattr(self.model, "config"):
                     self.model.config.attn_implementation = "eager"
                     self.model.config._attn_implementation = "eager"
@@ -391,6 +407,20 @@ class RefreshKVGenerator:
                         attn = getattr(layer, "self_attn", None)
                         if attn is not None and hasattr(attn, "attn_implementation") and prev is not None:
                             attn.attn_implementation = prev
+                # Restore SDPA settings if we captured them.
+                if hasattr(torch, "backends") and hasattr(torch.backends, "cuda"):
+                    for name, setter in (
+                        ("flash", "enable_flash_sdp"),
+                        ("mem_efficient", "enable_mem_efficient_sdp"),
+                        ("math", "enable_math_sdp"),
+                    ):
+                        if name in self.prev_sdp:
+                            set_fn = getattr(torch.backends.cuda, setter, None)
+                            if callable(set_fn):
+                                try:
+                                    set_fn(self.prev_sdp[name])
+                                except Exception:
+                                    pass
                 return False
 
         return _EagerCtx(self.model)
@@ -417,6 +447,10 @@ class RefreshKVGenerator:
                     position_ids=torch.tensor([[abs_pos]], device=self._device()),
                     cache_position=torch.tensor([abs_pos], device=self._device()),
                 )
+        if out.attentions is None:
+            raise RuntimeError(
+                "Recompute attention failed to return attentions. Ensure eager attention is enabled for recompute."
+            )
         return out.attentions
 
     def _device(self):
@@ -484,6 +518,8 @@ class RefreshKVGenerator:
                 step=0,
                 tag="prefill_recompute",
             )
+            if attentions is None:
+                raise RuntimeError("Recompute attention returned None at prefill.")
 
         num_kv_heads = getattr(self.model.config, "num_key_value_heads", None)
         for l in range(num_layers):
