@@ -43,12 +43,30 @@ python run_ablation.py --mode hybrid --num_examples 10 --max_new_tokens 128
 
 Logs are written to `logs/<run_id>/` as JSONL files (`events.jsonl`, `tokens.jsonl`).
 
+## Smoke Run (RULER, fast attention + recompute)
+
+This script runs a small RULER subset (4k tasks) with 5 samples each and uses
+fast attention for the main forward while **recomputing attention scores** only at
+prefill (last prompt token) and full refresh steps.
+
+```bash
+python run_smoke_ruler.py \
+  --tasks cwe_4k,qa_2_4k,vt_4k,niah_multikey_1_4k \
+  --num_samples 5 \
+  --max_new_tokens 64 \
+  --min_tokens 4096 \
+  --max_tokens 8192
+```
+
+This prints per-task and overall refresh frequency and overlap ratio, and writes logs to `logs/<run_id>/`.
+
 ## Repo Layout
 
 - `src/refreshkv.py` - core RefreshKV implementation (cache updates, triggers, logging hooks)
 - `src/logging_utils.py` - JSONL writers + helper utilities
 - `run_baseline.py` - baseline run on GSM8K subset + summary stats
 - `run_ablation.py` - entropy / hybrid trigger ablations
+- `run_smoke_ruler.py` - RULER smoke run (fast attention + score recompute)
 - `configs/default.yaml` - default config (QC stride, thresholds, cache budget, etc.)
 - `requirements.txt` - minimal dependencies
 
@@ -89,7 +107,19 @@ These are exposed as config options and called out here explicitly:
    We use **prefill logits** to generate the first token (standard HF behavior). This means token #1 is produced with full attention; scheduling starts at token #2. This is configurable only by code changes (see `first_token_from_prefill` note in `src/refreshkv.py`).
 
 6) **GQA attention aggregation**  
-   For GQA models, attention scores are aggregated across heads by **max** (PDF footnote on p.3 and Appendix A.3, p.12-13). Config: `head_aggregation`.
+   For GQA models, attention scores are aggregated by **max within each query-head group** (PDF footnote on p.3 and Appendix A.3, p.12-13). We use those **group-max scores directly** for top-K selection (no extra max/mean across groups). Config: `head_aggregation`.
+
+## Fast Attention + Score Recompute (Option A)
+
+When `use_fast_attention=true`, the main forward uses SDPA/FlashAttention and does **not**
+return attention matrices. To keep RefreshKV faithful, we recompute attention scores with a
+**single-token eager pass** only when needed:
+
+- **Prefill:** recompute attention for the last prompt token to initialize `C_p`.
+- **Full refresh:** recompute attention for the current token to refresh `C_p`.
+
+Recompute passes always use `use_cache=False` and **absolute** `cache_position`/`position_ids`
+to preserve RoPE alignment. Self-token is dropped before top-K when `recompute_drop_self=true`.
 
 ## GSM8K Fallback
 
