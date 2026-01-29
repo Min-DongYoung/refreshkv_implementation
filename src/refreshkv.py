@@ -366,6 +366,7 @@ class RefreshKVGenerator:
                 self.model = model
                 self.prev_attn = getattr(model.config, "attn_implementation", None)
                 self.prev_attn_priv = getattr(model.config, "_attn_implementation", None)
+                self.prev_out_attn = getattr(model.config, "output_attentions", None)
                 self.layer_prev = []
                 self.prev_sdp = {}
 
@@ -388,12 +389,22 @@ class RefreshKVGenerator:
                 if hasattr(self.model, "config"):
                     self.model.config.attn_implementation = "eager"
                     self.model.config._attn_implementation = "eager"
+                    self.model.config.output_attentions = True
+                if hasattr(self.model, "model") and hasattr(self.model.model, "config"):
+                    self.model.model.config.attn_implementation = "eager"
+                    self.model.model.config._attn_implementation = "eager"
+                    self.model.model.config.output_attentions = True
                 if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
                     for layer in self.model.model.layers:
                         attn = getattr(layer, "self_attn", None)
                         if attn is not None and hasattr(attn, "attn_implementation"):
                             self.layer_prev.append(attn.attn_implementation)
                             attn.attn_implementation = "eager"
+                            if hasattr(attn, "_attn_implementation"):
+                                attn._attn_implementation = "eager"
+                            if hasattr(attn, "config"):
+                                attn.config.attn_implementation = "eager"
+                                attn.config._attn_implementation = "eager"
                         else:
                             self.layer_prev.append(None)
                 return self
@@ -402,11 +413,20 @@ class RefreshKVGenerator:
                 if hasattr(self.model, "config"):
                     self.model.config.attn_implementation = self.prev_attn
                     self.model.config._attn_implementation = self.prev_attn_priv
+                    if self.prev_out_attn is not None:
+                        self.model.config.output_attentions = self.prev_out_attn
+                if hasattr(self.model, "model") and hasattr(self.model.model, "config"):
+                    self.model.model.config.attn_implementation = self.prev_attn
+                    self.model.model.config._attn_implementation = self.prev_attn_priv
+                    if self.prev_out_attn is not None:
+                        self.model.model.config.output_attentions = self.prev_out_attn
                 if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
                     for layer, prev in zip(self.model.model.layers, self.layer_prev):
                         attn = getattr(layer, "self_attn", None)
                         if attn is not None and hasattr(attn, "attn_implementation") and prev is not None:
                             attn.attn_implementation = prev
+                            if hasattr(attn, "_attn_implementation"):
+                                attn._attn_implementation = prev
                 # Restore SDPA settings if we captured them.
                 if hasattr(torch, "backends") and hasattr(torch.backends, "cuda"):
                     for name, setter in (
@@ -436,6 +456,49 @@ class RefreshKVGenerator:
     ):
         cache = _ensure_cache(self.model, cache_legacy, cache_position=abs_pos, logger=logger, step=step, tag=tag)
         with self._with_eager_attention():
+            # Diagnostics: log effective attention implementation and SDPA flags.
+            if logger is not None and step is not None:
+                layer0_attn = None
+                layer0_attn_priv = None
+                if hasattr(self.model, "model") and hasattr(self.model.model, "layers") and self.model.model.layers:
+                    attn0 = getattr(self.model.model.layers[0], "self_attn", None)
+                    if attn0 is not None:
+                        layer0_attn = getattr(attn0, "attn_implementation", None)
+                        layer0_attn_priv = getattr(attn0, "_attn_implementation", None)
+                diag = {
+                    "step": step,
+                    "recompute_diag": {
+                        "tag": tag,
+                        "model_attn_impl": getattr(self.model.config, "attn_implementation", None),
+                        "model_attn_impl_priv": getattr(self.model.config, "_attn_implementation", None),
+                        "model_output_attn": getattr(self.model.config, "output_attentions", None),
+                        "inner_attn_impl": getattr(getattr(self.model, "model", None), "config", None)
+                        and getattr(self.model.model.config, "attn_implementation", None),
+                        "inner_attn_impl_priv": getattr(getattr(self.model, "model", None), "config", None)
+                        and getattr(self.model.model.config, "_attn_implementation", None),
+                        "layer0_attn_impl": layer0_attn,
+                        "layer0_attn_impl_priv": layer0_attn_priv,
+                        "flash_sdp_enabled": (
+                            torch.backends.cuda.flash_sdp_enabled()
+                            if hasattr(torch.backends, "cuda")
+                            and callable(getattr(torch.backends.cuda, "flash_sdp_enabled", None))
+                            else None
+                        ),
+                        "mem_efficient_sdp_enabled": (
+                            torch.backends.cuda.mem_efficient_sdp_enabled()
+                            if hasattr(torch.backends, "cuda")
+                            and callable(getattr(torch.backends.cuda, "mem_efficient_sdp_enabled", None))
+                            else None
+                        ),
+                        "math_sdp_enabled": (
+                            torch.backends.cuda.math_sdp_enabled()
+                            if hasattr(torch.backends, "cuda")
+                            and callable(getattr(torch.backends.cuda, "math_sdp_enabled", None))
+                            else None
+                        ),
+                    },
+                }
+                logger.log_event(diag)
             with torch.inference_mode():
                 out = _model_forward(
                     self.model,
@@ -448,8 +511,13 @@ class RefreshKVGenerator:
                     cache_position=torch.tensor([abs_pos], device=self._device()),
                 )
         if out.attentions is None:
+            # Include a hint about current attention implementation for debugging.
+            attn_impl = getattr(self.model.config, "attn_implementation", None) or getattr(
+                self.model.config, "_attn_implementation", None
+            )
             raise RuntimeError(
-                "Recompute attention failed to return attentions. Ensure eager attention is enabled for recompute."
+                f"Recompute attention failed to return attentions (attn_implementation={attn_impl}). "
+                "Ensure eager attention is enabled for recompute."
             )
         return out.attentions
 
