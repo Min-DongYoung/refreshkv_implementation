@@ -62,7 +62,8 @@ def main():
     cfg.partial_cache_ratio = 0.125
     cfg.pool_kernel_size = 7
     cfg.head_aggregation = "max"
-    cfg.attn_implementation = "eager"
+    cfg.use_fast_attention = True
+    cfg.attn_implementation = "sdpa"
     cfg.max_new_tokens = args.max_new_tokens
     cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
 

@@ -260,12 +260,11 @@ def _aggregate_attention(attn: torch.Tensor, mode: str, num_kv_heads: Optional[i
     last = attn[:, :, -1, :]  # [b, heads, src_len]
     num_heads = last.shape[1]
     if mode == "max":
-        # For GQA, take max within each query-head group, then aggregate across groups without max.
+        # For GQA, take max within each query-head group and keep group-wise scores.
         if num_kv_heads is not None and num_kv_heads > 0 and num_kv_heads < num_heads:
             group = num_heads // num_kv_heads
             grouped = last.view(last.shape[0], num_kv_heads, group, last.shape[-1])
-            grouped_max = grouped.max(dim=2).values  # [b, num_kv_heads, src_len]
-            scores = grouped_max.mean(dim=1)  # preserve group-wise max, avoid max across groups
+            scores = grouped.max(dim=2).values  # [b, num_kv_heads, src_len]
         else:
             scores = last.max(dim=1).values
     elif mode == "mean":
@@ -287,8 +286,34 @@ def _pool_scores(scores: torch.Tensor, kernel_size: int, padding_mode: str) -> t
 
 
 def _select_topk(scores: torch.Tensor, k: int, order: str) -> Tuple[torch.Tensor, torch.Tensor]:
-    k = min(k, scores.shape[-1])
-    top_scores, top_idx = torch.topk(scores, k=k, largest=True)
+    # scores can be [src_len] or [group, src_len]
+    if scores.dim() == 2:
+        group, src_len = scores.shape
+        flat = scores.reshape(-1)
+        k = min(k, src_len)
+        # take extra candidates to reduce duplicates
+        cand_k = min(flat.numel(), max(k * 4, k))
+        top_scores, top_idx = torch.topk(flat, k=cand_k, largest=True)
+        selected = {}
+        for sc, idx in zip(top_scores.tolist(), top_idx.tolist()):
+            tok = idx % src_len
+            if tok not in selected:
+                selected[tok] = sc
+            if len(selected) >= k:
+                break
+        if len(selected) < k:
+            sorted_idx = torch.argsort(flat, descending=True)
+            for idx in sorted_idx.tolist():
+                tok = idx % src_len
+                if tok not in selected:
+                    selected[tok] = float(flat[idx].item())
+                if len(selected) >= k:
+                    break
+        top_idx = torch.tensor(list(selected.keys()), device=scores.device)
+        top_scores = torch.tensor(list(selected.values()), device=scores.device)
+    else:
+        k = min(k, scores.shape[-1])
+        top_scores, top_idx = torch.topk(scores, k=k, largest=True)
     if order == "score_asc":
         order_idx = torch.argsort(top_scores, descending=False)
     elif order == "score_desc":
