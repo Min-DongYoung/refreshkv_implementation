@@ -97,7 +97,14 @@ def main():
         cfg.max_new_tokens = args.max_new_tokens
 
     set_seed(cfg.seed)
-    force_eager_attention()
+    if cfg.use_fast_attention and cfg.attn_implementation not in ("sdpa", "flash_attention_2"):
+        print(
+            f"WARNING: use_fast_attention=True but attn_implementation='{cfg.attn_implementation}'. "
+            "Switching to 'sdpa'."
+        )
+        cfg.attn_implementation = "sdpa"
+    if cfg.attn_implementation == "eager" and not cfg.use_fast_attention:
+        force_eager_attention()
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -107,7 +114,13 @@ def main():
         device_map="auto" if cfg.device == "cuda" else None,
     )
     model.eval()
-    assert_eager_attention(model)
+    if cfg.attn_implementation == "eager" and not cfg.use_fast_attention:
+        assert_eager_attention(model)
+    else:
+        attn_impl = getattr(model.config, "attn_implementation", None) or getattr(
+            model.config, "_attn_implementation", None
+        )
+        print(f"Attention implementation: {attn_impl}")
 
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id

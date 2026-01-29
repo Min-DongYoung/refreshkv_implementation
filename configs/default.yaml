@@ -29,5 +29,7 @@ first_token_from_prefill: true
 pending_merge_policy: pending_kv
 
 attn_implementation: eager
+use_fast_attention: false
+recompute_drop_self: true
 
 max_log_indices: 200

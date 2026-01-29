@@ -56,6 +56,10 @@ class RefreshKVConfig:
     # Optional attention implementation control (if set in loader)
     attn_implementation: str = "eager"
 
+    # Flash/SDPA path with eager recompute for attention scores
+    use_fast_attention: bool = False
+    recompute_drop_self: bool = True
+
     # Logging / limits
     max_log_indices: int = 200
 
@@ -250,12 +254,20 @@ def _force_eager_attention(model) -> None:
                 attn.attn_implementation = "eager"
 
 
-def _aggregate_attention(attn: torch.Tensor, mode: str) -> torch.Tensor:
+def _aggregate_attention(attn: torch.Tensor, mode: str, num_kv_heads: Optional[int] = None) -> torch.Tensor:
     # attn: [b, heads, tgt_len, src_len]
     attn = attn.float()
     last = attn[:, :, -1, :]  # [b, heads, src_len]
+    num_heads = last.shape[1]
     if mode == "max":
-        scores = last.max(dim=1).values
+        # For GQA, take max within each query-head group, then aggregate across groups without max.
+        if num_kv_heads is not None and num_kv_heads > 0 and num_kv_heads < num_heads:
+            group = num_heads // num_kv_heads
+            grouped = last.view(last.shape[0], num_kv_heads, group, last.shape[-1])
+            grouped_max = grouped.max(dim=2).values  # [b, num_kv_heads, src_len]
+            scores = grouped_max.mean(dim=1)  # preserve group-wise max, avoid max across groups
+        else:
+            scores = last.max(dim=1).values
     elif mode == "mean":
         scores = last.mean(dim=1)
     elif mode == "first":
@@ -323,10 +335,69 @@ class RefreshKVGenerator:
         self.entropy_stats = EntropyStats()
         self._layerwise_warned = False
 
+    def _with_eager_attention(self):
+        class _EagerCtx:
+            def __init__(self, model):
+                self.model = model
+                self.prev_attn = getattr(model.config, "attn_implementation", None)
+                self.prev_attn_priv = getattr(model.config, "_attn_implementation", None)
+                self.layer_prev = []
+
+            def __enter__(self):
+                if hasattr(self.model, "config"):
+                    self.model.config.attn_implementation = "eager"
+                    self.model.config._attn_implementation = "eager"
+                if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+                    for layer in self.model.model.layers:
+                        attn = getattr(layer, "self_attn", None)
+                        if attn is not None and hasattr(attn, "attn_implementation"):
+                            self.layer_prev.append(attn.attn_implementation)
+                            attn.attn_implementation = "eager"
+                        else:
+                            self.layer_prev.append(None)
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                if hasattr(self.model, "config"):
+                    self.model.config.attn_implementation = self.prev_attn
+                    self.model.config._attn_implementation = self.prev_attn_priv
+                if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+                    for layer, prev in zip(self.model.model.layers, self.layer_prev):
+                        attn = getattr(layer, "self_attn", None)
+                        if attn is not None and hasattr(attn, "attn_implementation") and prev is not None:
+                            attn.attn_implementation = prev
+                return False
+
+        return _EagerCtx(self.model)
+
+    def _recompute_attn_for_token(
+        self,
+        input_ids: torch.Tensor,
+        cache_legacy,
+        abs_pos: int,
+        logger=None,
+        step: Optional[int] = None,
+        tag: str = "recompute",
+    ):
+        cache = _ensure_cache(self.model, cache_legacy, cache_position=abs_pos, logger=logger, step=step, tag=tag)
+        with self._with_eager_attention():
+            with torch.inference_mode():
+                out = _model_forward(
+                    self.model,
+                    input_ids=input_ids,
+                    past_key_values=cache,
+                    use_cache=False,  # do not mutate caches
+                    output_attentions=True,
+                    return_dict=True,
+                    position_ids=torch.tensor([[abs_pos]], device=self._device()),
+                    cache_position=torch.tensor([abs_pos], device=self._device()),
+                )
+        return out.attentions
+
     def _device(self):
         return next(self.model.parameters()).device
 
-    def _prefill(self, input_ids: torch.Tensor) -> Tuple[CacheState, torch.Tensor]:
+    def _prefill(self, input_ids: torch.Tensor, logger=None) -> Tuple[CacheState, torch.Tensor]:
         device = self._device()
         assert input_ids.shape[0] == 1, "Only batch size 1 is supported in this baseline."
         input_ids = input_ids.to(device)
@@ -344,7 +415,7 @@ class RefreshKVGenerator:
                 position_ids=position_ids,
                 cache_position=cache_position,
                 use_cache=True,
-                output_attentions=True,
+                output_attentions=not self.cfg.use_fast_attention,
                 return_dict=True,
             )
         capture.detach()
@@ -353,27 +424,14 @@ class RefreshKVGenerator:
         attentions = outputs.attentions
         logits = outputs.logits
 
-        if past is None or attentions is None:
-            # Retry once with eager attention forced; required to access attention scores.
-            _force_eager_attention(self.model)
-            with torch.inference_mode():
-                outputs = _model_forward(
-                    self.model,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    cache_position=cache_position,
-                    use_cache=True,
-                    output_attentions=True,
-                    return_dict=True,
-                )
-            past = _normalize_past_key_values(outputs.past_key_values)
-            attentions = outputs.attentions
-            if past is None or attentions is None:
-                raise RuntimeError(
-                    "Model did not return past_key_values/attentions; ensure eager attention is enabled "
-                    "(attn_implementation='eager', SDPA disabled)."
-                )
+        if past is None:
+            raise RuntimeError("Model did not return past_key_values.")
+
+        if attentions is None and not self.cfg.use_fast_attention:
+            # Expect attentions in eager mode.
+            raise RuntimeError(
+                "Model did not return attentions in eager mode. Ensure attn_implementation='eager'."
+            )
 
         num_layers = len(past)
         prompt_len = input_ids.shape[1]
@@ -386,10 +444,33 @@ class RefreshKVGenerator:
         q_last_full = []
         q_last_full_per_head = [] if self.cfg.log_per_head_similarity else None
 
+        # If using fast attention, recompute attention for the last prompt token.
+        if self.cfg.use_fast_attention:
+            if prompt_len <= 1:
+                raise RuntimeError("Prompt length must be > 1 for recompute with drop-self.")
+            cf_excl_last = []
+            for (k_full, v_full) in past:
+                cf_excl_last.append((k_full[:, :, :-1, :], v_full[:, :, :-1, :]))
+            attentions = self._recompute_attn_for_token(
+                input_ids[:, -1:],
+                cf_excl_last,
+                abs_pos=prompt_len - 1,
+                logger=logger,
+                step=0,
+                tag="prefill_recompute",
+            )
+
+        num_kv_heads = getattr(self.model.config, "num_key_value_heads", None)
         for l in range(num_layers):
             attn = attentions[l]
-            scores = _aggregate_attention(attn, self.cfg.head_aggregation)
+            scores = _aggregate_attention(attn, self.cfg.head_aggregation, num_kv_heads=num_kv_heads)
             scores = _pool_scores(scores, self.cfg.pool_kernel_size, self.cfg.pool_padding)
+            if self.cfg.recompute_drop_self and scores.shape[-1] > 1:
+                scores = scores[..., :-1]
+            if l == 0:
+                k = min(k, scores.shape[-1])
+            if k < 1:
+                raise RuntimeError("No tokens available for topK selection after drop-self.")
             # PDF p.4 Algorithm 1: Cp initialized with reverse(arg top-k ...) then evict lowest.
             idx, sc = _select_topk(scores.squeeze(0), k=k, order=self.cfg.topk_order)
 
@@ -473,7 +554,7 @@ class RefreshKVGenerator:
         if not cfg.first_token_from_prefill:
             raise NotImplementedError("first_token_from_prefill=False is not supported in this baseline.")
 
-        state, prefill_logits = self._prefill(input_ids)
+        state, prefill_logits = self._prefill(input_ids, logger=logger)
         full_token_ids = input_ids[0].tolist()
         prompt_len = len(full_token_ids)
 
@@ -690,7 +771,7 @@ class RefreshKVGenerator:
                     input_ids=current_token,
                     past_key_values=pkv_cache,
                     use_cache=True,
-                    output_attentions=True,
+                    output_attentions=not cfg.use_fast_attention,
                     return_dict=True,
                     position_ids=torch.tensor([[abs_pos]], device=self._device()),
                     cache_position=torch.tensor([abs_pos], device=self._device()),
@@ -703,6 +784,16 @@ class RefreshKVGenerator:
 
             past_out = _normalize_past_key_values(out.past_key_values)
             attn_out = out.attentions
+            attn_recomp = None
+            if cfg.use_fast_attention and is_check and any(layer_use_full):
+                attn_recomp = self._recompute_attn_for_token(
+                    current_token,
+                    pkv_in,
+                    abs_pos=abs_pos,
+                    logger=logger,
+                    step=step,
+                    tag="refresh_recompute",
+                )
             logits = out.logits[:, -1, :]
 
             # Pick next token
@@ -720,6 +811,7 @@ class RefreshKVGenerator:
             # Update caches per layer
             refresh_layers = []
             refresh_diffs = {}
+            num_kv_heads = getattr(self.model.config, "num_key_value_heads", None)
             for l in range(num_layers):
                 present_k, present_v = past_out[l]
 
@@ -744,24 +836,32 @@ class RefreshKVGenerator:
                                 state.q_last_full_per_head[l] = q_probe_heads[l]
 
                     # Build new Cp from attention scores
-                    if attn_out is None:
-                        raise RuntimeError("Attention scores missing; set attn_implementation='eager'.")
+                    if attn_out is None and attn_recomp is None:
+                        raise RuntimeError(
+                            "Attention scores missing; enable recompute_attn_scores or use eager attention."
+                        )
                     # PDF p.4: refresh Cp using top-K tokens based on attention scores from full attention.
-                    attn = attn_out[l]
-                    scores = _aggregate_attention(attn, cfg.head_aggregation)
+                    attn = attn_out[l] if attn_out is not None else attn_recomp[l]
+                    scores = _aggregate_attention(attn, cfg.head_aggregation, num_kv_heads=num_kv_heads)
                     scores = _pool_scores(scores, cfg.pool_kernel_size, cfg.pool_padding)
-                    idx, sc = _select_topk(scores.squeeze(0), k=state.k, order=cfg.topk_order)
+                    if cfg.recompute_drop_self and scores.shape[-1] > 1:
+                        scores = scores[..., :-1]
+                    k = min(state.k, scores.shape[-1])
+                    if k < 1:
+                        raise RuntimeError("No tokens available for topK selection after drop-self.")
+                    idx, sc = _select_topk(scores.squeeze(0), k=k, order=cfg.topk_order)
                     cf_k, cf_v = state.cf[l]
                     assert idx.max().item() < cf_k.shape[2]
                     cp_k = torch.index_select(cf_k, dim=2, index=idx)
                     cp_v = torch.index_select(cf_v, dim=2, index=idx)
-                    assert cp_k.shape[2] == state.k
+                    assert cp_k.shape[2] == k
 
                     before_idx = state.cp_idx_abs[l]
                     after_idx = idx.tolist()
                     state.cp[l] = (cp_k, cp_v)
                     state.cp_idx_abs[l] = after_idx
                     state.cp_scores[l] = sc.tolist()
+                    state.k = k
                     assert len(after_idx) == state.k
                     state.pos_full[l] = step + 1
 
