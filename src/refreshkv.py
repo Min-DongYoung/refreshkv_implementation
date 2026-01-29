@@ -280,9 +280,17 @@ def _pool_scores(scores: torch.Tensor, kernel_size: int, padding_mode: str) -> t
     if kernel_size <= 1:
         return scores
     pad = kernel_size // 2 if padding_mode == "same" else 0
-    pooled = F.max_pool1d(scores.unsqueeze(1), kernel_size=kernel_size, stride=1, padding=pad)
-    pooled = pooled.squeeze(1)
-    return pooled
+    if scores.dim() == 2:
+        pooled = F.max_pool1d(scores.unsqueeze(1), kernel_size=kernel_size, stride=1, padding=pad)
+        pooled = pooled.squeeze(1)
+        return pooled
+    if scores.dim() == 3:
+        b, g, s = scores.shape
+        flat = scores.reshape(b * g, 1, s)
+        pooled = F.max_pool1d(flat, kernel_size=kernel_size, stride=1, padding=pad)
+        pooled = pooled.reshape(b, g, s)
+        return pooled
+    raise ValueError(f"Unsupported scores shape for pooling: {scores.shape}")
 
 
 def _select_topk(scores: torch.Tensor, k: int, order: str) -> Tuple[torch.Tensor, torch.Tensor]:
